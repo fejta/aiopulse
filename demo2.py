@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import asyncio
+import random
 import socket
 import sys
 
@@ -38,6 +39,7 @@ class Command:
     ERROR = 'E'
 
     ARG_QUERY = '?'
+
     questions = [
             ERROR,
             MAC_ADDRESS,
@@ -121,7 +123,7 @@ class Hub:
             return
 
         self.unknown = self.unknown or []
-        self.unknown.append(c)
+        self.unknown.append(pkt)
 
     async def update(self, pkt):
         """Update state to reflect this hub or device packet."""
@@ -175,11 +177,12 @@ class Motor:
     name = ''
     major = 0
     minor = 0
-    moving = False
+    movement = ''
     position = 0
     rotation = 0
     style = ''
     voltage = 0
+    strength = 0
 
     styles = {
             'B': 'Base',
@@ -217,6 +220,10 @@ class Motor:
 
         if self.style == 'D' or self.voltage:
             parts.append(' with %.2fV battery' % self.voltage)
+        if self.strength:
+            parts.append(' (signal strength %d)' % self.strength)
+        if self.movement:
+            parts.append(', moving %s' % self.movement)
         return ''.join(parts)
 
     def request_name(self):
@@ -279,7 +286,17 @@ class Motor:
             raise ValueError('wrong device', self.device, packet.device)
         unknown = False
         err = False
-        for cmd in packet.commands:
+        if packet.strength:
+            # Average the last two strength reports
+            try:
+                val = int(packet.strength, base=16)
+            except ValueError:
+                pass
+            if not self.strength:
+                self.strength = val
+            else:
+                self.strength = int(self.strength*0.5 + val*0.5)
+        for i, cmd in enumerate(packet.commands):
             kind, arg = cmd.kind, cmd.arg
             if kind == Command.ROOM:
                 self.room = arg
@@ -288,20 +305,52 @@ class Motor:
             elif kind == Command.LIST and len(arg) == 3:
                 self.style, self.major, self.minor = arg
             elif kind == Command.POSITION:
+                self.movement = ''
                 try:
                     self.position = int(arg)
                 except ValueError:
                     err = True
             elif kind == Command.ROTATION:
                 try:
-                    self.rotation = int(arg)
+                    goal = int(arg)
                 except ValueError:
                     err = True
+                else:
+                    # A command ack or part of the position report?
+                    if i: # report
+                        self.movement = ''
+                        self.rotation = goal
+                    else:
+                        # Do not have curtains, so just guessing
+                        # Thinking if we're going from 0 to 90 that
+                        # means we are going from 0 to 90 degrees rotation
+                        # thus larger goal == counter clockwise
+                        if goal > self.rotation:
+                            self.movement = 'counter-clockwise'
+                        else:
+                            self.movement = 'clockwise'
+
             elif kind == Command.VOLTAGE:
                 try:
                     self.voltage = float(arg)/100.
                 except ValueError:
                     err = True
+            elif kind == Command.MOVE:
+                try:
+                    goal = int(arg)
+                except ValueError:
+                    err = True
+                else:
+                    if goal > self.position:
+                        self.movement = 'down'
+                    else:
+                        self.movement = 'up'
+            elif kind in [Command.DOWN, Command.JOG_DOWN]:
+                self.movement = 'down'
+            elif kind in [Command.UP, Command.JOG_UP]:
+                self.movement = 'up'
+            elif kind == Command.STOP:
+                self.movement = ''
             else:
                 unknown = True
         if unknown:
@@ -321,7 +370,7 @@ class Packet:
     def __init__(self, device, *commands, strength=None):
         self.device = device
         self.commands = commands
-        self.strength=strength
+        self.strength = strength
 
     def encode(self):
         """Returns the byte representation of this packet."""
@@ -407,7 +456,7 @@ class Packet:
         return Packet(device, *commands, strength=strength)
 
     def __repr__(self):
-        return 'Packet(%r, *%r)' % (self.device, self.commands)
+        return 'Packet(%r, *%r, strength=%s)' % (self.device, self.commands, self.strength)
 
 
 async def report_forever(*hubs, delay=1.):
@@ -445,6 +494,22 @@ async def scan(host, port):
     return True
 
 
+async def fidget(hub, delay=10):
+    await asyncio.sleep(delay)
+    motor = random.choice(list(hub.motors.values()))
+    pos = random.randint(0,100)
+    print('futzing with', motor.name, pos)
+    pkt = motor.set_position(pos)
+    await hub.write(pkt)
+    await asyncio.sleep(delay)
+    newpos = pos
+    while newpos == pos:
+        newpos = random.randint(0,100)
+    print('futzing with', motor.name, newpos)
+    pkt = motor.set_position(newpos)
+    await hub.write(pkt)
+
+
 class Scanner:
     """Scanner can concurrently scan for hosts listening on a port."""
     listening = None
@@ -464,17 +529,20 @@ class Scanner:
         return self.listening
 
 
-async def main():
+async def main(host=None, port=1487):
     print('Determining ip address...', end='', flush=True)
     addr = ip_address()
     print(addr)
     addrs = near(addr)
     print('Scanning for nearby hubs...', end='', flush=True)
     s = Scanner()
-    found = await s.scanall(*addrs)
-    if not s.listening:
-        print('no hubs found')
-        sys.exit(1)
+    if host:
+        found = [(host, port)]
+    else:
+        found = await s.scanall(*addrs)
+        if not s.listening:
+            print('no hubs found')
+            sys.exit(1)
 
     hubs = [Hub(h, port=p) for (h, p) in found]
     print('found %d hubs:' % len(hubs))
@@ -484,10 +552,13 @@ async def main():
     await asyncio.gather(*(h.connect() for h in hubs))
     print('done')
     print('starting up for 60s...')
-    await asyncio.wait({
+    done, pending = await asyncio.wait({
         report_forever(*hubs),
+        fidget(hubs[0]),
         *(h.read_all() for h in hubs),
     }, timeout=60, return_when=asyncio.FIRST_EXCEPTION)
+    print('done', done)
+    print('pending', pending)
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    asyncio.run(main(*sys.argv[1:]))
