@@ -1,9 +1,217 @@
 #!/usr/bin/env python3
 
+from typing import Any
+from typing import Callable
+from typing import Optional
+import functools
+
+
 import asyncio
+import logging
 import random
 import socket
 import sys
+import time
+
+import aiopulse
+
+
+_LOGGER = logging.getLogger(__name__)
+
+async def yieldall(iterable):
+    return [i async for i in iterable]
+
+
+def patch_aiopulse():
+    old = aiopulse.Hub.discover
+    async def patched(*a, **kw):
+        ones, twos = await asyncio.gather(
+                yieldall(old(*a, **kw)),
+                HubAdapter.discover(),
+        )
+        for hub in ones:
+            yield hub
+        for hub in twos:
+            yield hub
+    aiopulse.Hub.discover = patched
+
+
+class HubAdapter:
+
+    callbacks = None
+    _hub = None
+    rollers = None
+    running = False
+
+    @staticmethod
+    async def discover():
+        _LOGGER.debug('Determining ip address')
+        addr = ip_address()
+        _LOGGER.info('Looking for Pulse 2 hubs near %s', addr)
+        addrs = near(addr)
+        s = Scanner()
+        found = await s.scanall(*addrs)
+        _LOGGER.debug('Found %d hosts: %s', len(found), found)
+        hubs = await asyncio.gather(*(HubAdapter._create(h, p) for (h, p) in found))
+        # Remove anything without a serial (most likely a bad server
+        _LOGGER.info('Pulse 2 discovery complete')
+        return [h for h in hubs if h]
+
+
+    @staticmethod
+    async def _create(host, port):
+        hub = HubAdapter(host, port)
+        asyncio.create_task(hub.run())
+        end = time.time() + 5
+        while not hub.id and time.time() < end:
+            await asyncio.sleep(0.1)
+        if not hub.id:
+            return None
+        return hub
+
+    def __init__(self, host, port):
+        self._hub = Hub(host, port)
+        self._hub.update = self._update_hook
+        self.rollers = {}
+        self.callbacks = []
+
+    def __str__(self):
+        return str(self._hub)
+
+    @property
+    def host(self):
+        return self._hub.host
+
+    @property
+    def id(self):
+        return self._hub.serial
+
+    async def stop(self):
+        await self._hub.disconnect()
+        self.running = False
+
+    async def run(self):
+        self.running = True
+        while self.running:
+            try:
+                await self._hub.connect()
+                await self._hub.read_all()
+            except asyncio.CancelledError:
+                return
+            except:
+                _LOGGER.exception('read_all() failed')
+                if self.running:
+                    await asyncio.sleep(5)
+
+    def callback_subscribe(self, cb):
+        if cb in self.callbacks:
+            return
+        self.callbacks.append(cb)
+
+    def callback_unsubscribe(self, cb):
+        if cb not in self.callbacks:
+            return
+        self.callbacks.remove(cb)
+
+    async def _update_hook(self, pkt):
+        previously = self._hub.motors
+        await Hub.update(self._hub, pkt)
+        notify = False
+        for d, m in self._hub.motors.items():
+            if d in self.rollers:
+                continue
+            _LOGGER.info('Found roller: %s', d)
+            self.rollers[d] = RollerAdapter(self._hub, m)
+            notify = True
+        if notify:
+            t = aiopulse.UpdateType.rollers
+            if not self.callbacks:
+                _LOGGER.debug('No callbacks for hub %s', self.id)
+            for cb in self.callbacks:
+                await self._async_add_job(cb, t)
+            return
+        roller = self.rollers.get(pkt.device)
+        if not roller:
+            return
+        _LOGGER.debug('Roller update: %s', pkt.device)
+        if not roller.callbacks:
+            _LOGGER.debug('No callbacks for roller %s', roller.id)
+        for cb in roller.callbacks:
+            await self._async_add_job(cb)
+
+    async def _async_add_job(self, target: Callable[..., Any], *args: Any) -> Optional[asyncio.Future]:
+        """Add a job from within the event loop.
+        This method must be run in the event loop.
+        target: target to call.
+        args: parameters for method to call.
+        """
+        task = None
+
+        # Check for partials to properly determine if coroutine function
+        check_target = target
+        while isinstance(check_target, functools.partial):
+            check_target = check_target.func
+
+        if asyncio.iscoroutine(check_target):
+            task = asyncio.create_task(target)  # type: ignore
+        elif asyncio.iscoroutinefunction(check_target):
+            task = asyncio.create_task(target(*args))
+        else:
+            task = asyncio.get_running_loop().run_in_executor(  # type: ignore
+                None, target, *args
+            )
+
+        return task
+
+
+class RollerAdapter:
+    callbacks = None
+    motor = None
+
+    def __init__(self, hub, motor):
+        self.motor = motor
+        self.callbacks = []
+
+    @property
+    def id(self):
+        return self.motor.device
+
+    @property
+    def name(self):
+        return self.motor.name
+
+    @property
+    def type(self):
+        style = self.motor.style
+        if style == 'C':
+            return 10 # activates tilt and position
+        if style in ['D','A']:
+            return 1 # Not 10 or 7
+    @property
+    def closed_percent(self):
+        return self.motor.position
+
+    async def move_up(self):
+        await self.move_to(0)
+
+    async def move_down(self):
+        await self.move_to(100)
+
+    async def move_to(self, percent):
+        await self.set_position(percent)
+
+    async def move_stop(self):
+        await self.hub.write(self.motor.stop())
+
+    def callback_subscribe(self, cb):
+        if cb in self.callbacks:
+            return
+        self.callbacks.append(cb)
+
+    def callback_unsubscribe(self, cb):
+        if cb not in self.callbacks:
+            return
+        self.callbacks.remove(cb)
 
 
 class Command:
@@ -24,6 +232,7 @@ class Command:
     NAME= 'NAME'
     MAC_ADDRESS = 'MAC'
     SERIAL_NUMBER = 'SN'
+    FIRMWARE_VERSION = 'FWV'
     LIST = 'v'
 
     DOWN = 'c'
@@ -42,12 +251,12 @@ class Command:
 
     questions = [
             ERROR,
+            FIRMWARE_VERSION,
+            LIST,
             MAC_ADDRESS,
             NAME,
             ROOM,
             SERIAL_NUMBER,
-            LIST,
-            ERROR,
     ]
 
 class Hub:
@@ -58,7 +267,12 @@ class Hub:
     updated = False
     mac = ''
     name = ''
+    serial = ''
+    firmware = ''
     unknown = None
+
+    reader = None
+    writer = None
 
     def __init__(self, host, port=None):
         if not host:
@@ -78,26 +292,50 @@ class Hub:
         return '\n'.join(parts)
 
     async def connect(self):
-        # Connect to the hub
+        """Connect to the hub."""
+        _LOGGER.debug('Connecting to %s:%d', self.host, self.port)
         self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
         # We are connected, get data about the hub
+        await self.write(self.request_serial())
+        await self.write(self.request_firmware())
         await self.write(self.request_mac())
         await self.write(self.request_name())
         # And see what is paired with it
         await self.write(self.request_motors())
 
+    async def disconnect(self):
+        """Disconnect from the hub."""
+        if not self.writer:
+            return
+        self.writer.close()
+        await self.writer.wait_closed()
+        self.writer = None
+        self.reader = None
+
     async def read_all(self):
         """Reads a packet forever."""
-        while True:
-            await self.read_one()
+        success = False
+        while self.reader:
+            try:
+                await self.read_one()
+                success = True
+            except asyncio.IncompleteReadError:
+                if not success:
+                    _LOGGER.warning('Incomplete read', exc_info=True)
+                return
+        _LOGGER.debug('Finished reading')
 
     async def read_one(self):
         """Reads one packet."""
+        if not self.reader:
+            await self.connect()
         pkt = await self.next_packet()
         await self.update(pkt)
 
     async def write(self, pkt):
         """Writes a packet."""
+        if not self.writer:
+            await self.connect()
         buf = pkt.encode()
         self.writer.write(buf)
         await self.writer.drain()
@@ -117,6 +355,10 @@ class Hub:
                 self.name = c.arg
             elif c.kind == Command.MAC_ADDRESS:
                 self.mac = c.arg
+            elif c.kind == Command.SERIAL_NUMBER:
+                self.serial = c.arg
+            elif c.kind == Command.FIRMWARE_VERSION:
+                self.firmware = c.arg
             else:
                 unknown = True
         if not unknown:
@@ -169,6 +411,16 @@ class Hub:
     def request_mac(cls):
         """Return a packet that requests the mac address of this hub."""
         return Packet(cls.device, Command(Command.MAC_ADDRESS, Command.ARG_QUERY))
+
+    @classmethod
+    def request_serial(cls):
+        """Return a packet that requests the serial number of this hub."""
+        return Packet(cls.device, Command(Command.SERIAL_NUMBER, Command.ARG_QUERY))
+
+    @classmethod
+    def request_firmware(cls):
+        """Return a packet that requests the firware version of this hub."""
+        return Packet(cls.device, Command(Command.FIRMWARE_VERSION, Command.ARG_QUERY))
 
 
 class Motor:
@@ -528,6 +780,23 @@ class Scanner:
         await asyncio.gather(*(self.scan(h, port) for h in hosts))
         return self.listening
 
+async def adapt(host=None, port=1487):
+    patch_aiopulse()
+    hubs = []
+    async for hub in aiopulse.Hub.discover():
+        hubs.append(hub)
+    for h in hubs:
+        def holler(*a, **kw):
+            print(str(h), a, kw)
+            for r in h.rollers.values():
+                r.callback_subscribe(holler)
+        h.callback_subscribe(holler)
+    await asyncio.sleep(20)
+    for h in hubs:
+        await h.stop()
+    print(str(h))
+    print('done')
+
 
 async def main(host=None, port=1487):
     print('Determining ip address...', end='', flush=True)
@@ -561,4 +830,7 @@ async def main(host=None, port=1487):
     print('pending', pending)
 
 if __name__ == '__main__':
+    logging.basicConfig()
+    _LOGGER.setLevel(logging.DEBUG)
+    #asyncio.run(adapt(*sys.argv[1:]))
     asyncio.run(main(*sys.argv[1:]))
